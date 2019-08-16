@@ -20,7 +20,9 @@ import tempfile
 import threading
 import time
 import uuid
+import base64
 import webbrowser
+import colorama
 from ipaddress import ip_network
 from six.moves.urllib.request import urlopen  # pylint: disable=import-error
 from six.moves.urllib.error import URLError  # pylint: disable=import-error
@@ -28,6 +30,7 @@ import requests
 from knack.log import get_logger
 from knack.util import CLIError
 from knack.prompting import prompt_pass, NoTTYException
+from kubernetes import client, config
 
 import yaml  # pylint: disable=import-error
 import dateutil.parser  # pylint: disable=import-error
@@ -530,9 +533,9 @@ def aks_create(cmd, client, resource_group_name, name, ssh_key_value,  # pylint:
     if not dns_name_prefix:
         dns_name_prefix = _get_default_dns_prefix(name, resource_group_name, subscription_id)
 
-    rg_location = _get_rg_location(cmd.cli_ctx, resource_group_name)
-    if location is None:
-        location = rg_location
+    #rg_location = _get_rg_location(cmd.cli_ctx, resource_group_name)
+    #if location is None:
+    #    location = rg_location
 
     agent_pool_profile = ManagedClusterAgentPoolProfile(
         name=_trim_nodepoolname(nodepool_name),  # Must be 12 chars or less before ACS RP adds to it
@@ -812,6 +815,104 @@ ADDONS = {
     'kube-dashboard': 'kubeDashboard'
 }
 
+def aks_diag(cmd, accountname, saskey):
+    config.load_kube_config()
+    cluster_config = config.kube_config.list_kube_config_contexts()
+    cluster_name = cluster_config[1]['context']['cluster']
+    print("Starts collecting diag info for cluster %s " % colorama.Fore.RED + colorama.Back.GREEN + cluster_name + colorama.Style.RESET_ALL)
+
+    folder = cluster_name.lower() + "-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    v1 = client.CoreV1Api()
+    api = client.AppsV1Api()
+    secret = {
+        "metadata":{
+            "name": "azure-blob"
+        },
+        "type": "Opaque",
+        "data": {
+            "accountName": (base64.b64encode(bytes(accountname,'ascii'))).decode('ascii'),
+            "sasKey": (base64.b64encode(bytes(saskey,'ascii'))).decode('ascii')
+        }
+    }
+
+    ds = {
+        "metadata":{
+            "name": "aks-diagnostic",
+            "labels": {
+                "app": "aks-diagnostic"
+            }
+        },
+        "spec": {
+            "selector": {
+                "matchLabels": {
+                    "app": "aks-diagnostic"
+                }
+            },
+            "template":{
+                "metadata":{
+                    "labels":{
+                        "app": "aks-diagnostic"
+                    }
+                },
+                "spec":{
+                    "hostPID": True,
+                    "containers": [
+                        {
+                            "name": "aks-diagnostic",
+                            "env":[
+                                {
+                                    "name": "CLUSTER",
+                                    "value": folder
+                                }
+                            ],
+                            "image": "aksrepos.azurecr.io/staging/aks-diagnostic:v0.3",
+                            "securityContext": {
+                                "privileged": True
+                            },
+                            "imagePullPolicy": "Always",
+                            "volumeMounts":[
+                                {
+                                    "mountPath": "/etc/azure-blob",
+                                    "name": "azure-blob",
+                                    "readOnly": True
+                                }
+                            ]
+                        }
+                    ],
+                    "volumes":[
+                        {
+                            "name": "azure-blob",
+                            "secret": {
+                                "secretName": "azure-blob"
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    ret = v1.list_secret_for_all_namespaces(watch=False)
+    for i in ret.items:
+        if i.metadata.name.lower() == "azure-blob".lower():
+            print("Deleting the secret.")
+            v1.delete_namespaced_secret(name="azure-blob", namespace="default")
+
+    resp = v1.create_namespaced_secret(body=secret, namespace="default")
+    print("Secret '%s' created." % resp.metadata.name)
+
+    ret = api.list_daemon_set_for_all_namespaces(watch=False)
+    for i in ret.items:
+        if i.metadata.name.lower() == "aks-diagnostic".lower():
+            print("Deleting the daemon set.")
+            api.delete_namespaced_daemon_set(name="aks-diagnostic", namespace="default")
+
+    # files = urlopen("https://xizhargwestus2diag.blob.core.windows.net/yaml/daemonset.yaml")
+    # ds = yaml.safe_load(files)
+    resp = api.create_namespaced_daemon_set(body=ds, namespace="default")
+    print("Daemonset '%s' created." % resp.metadata.name)
+    print("You can find the diag info in: https://%s.blob.core.windows.net/%s" % (accountname, folder))
 
 def aks_scale(cmd, client, resource_group_name, name, node_count, nodepool_name="", no_wait=False):
     instance = client.get(resource_group_name, name)
